@@ -1,0 +1,331 @@
+# I revised CrossAttentionMap extraction code in Prompt-to-Prompt for ProFusion
+
+import torch
+import os
+from torch import nn
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from diffusers import StableDiffusionPromptNetPipeline, StableDiffusionInpaintPipeline
+from transformers import AutoProcessor, CLIPModel
+from torchvision.transforms import InterpolationMode
+from tqdm import tqdm
+from accelerate import Accelerator
+import torchvision.transforms as T
+import random
+
+BICUBIC = InterpolationMode.BICUBIC
+from PIL import Image
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler, DDIMScheduler, DDPMScheduler
+torch.manual_seed(0)
+
+# This examples was implemented on A6000
+
+def sampling_kwargs(step=50, prompt="in Ghibli style", cfg=5.0, ref_cfg=5.0, residual=0.0, fusion=True, 
+                    refine_step=0, refine_eta=1., refine_emb_scale=0.7, refine_cfg=5.0):
+    kwargs = {}
+    kwargs["num_inference_steps"] = step 
+    # This is for simplicity, revise it if you want something else
+    kwargs["prompt"] = "a holder " + prompt 
+    kwargs["guidance_scale"] = cfg 
+    kwargs["res_prompt_scale"] = residual
+    if fusion: # if we use a reference prompt for structure information fusion
+        kwargs["ref_prompt"] = "a person  " + prompt
+        kwargs["guidance_scale_ref"] = ref_cfg  # also can use different scale
+        kwargs["refine_step"] = refine_step  # when refine_step == 0, it means we assume conditions are independent (which leads to worse results)
+        kwargs["refine_eta"] = refine_eta
+        kwargs["refine_emb_scale"] = refine_emb_scale 
+        kwargs["refine_guidance_scale"] = refine_cfg            
+    else:
+        kwargs["ref_prompt"] = None
+        kwargs["guidance_scale_ref"] = 0.
+        kwargs["refine_step"] = 0
+    return kwargs
+
+
+def get_concat_h(im1, im2):
+    dst = Image.new('RGB', (im1.width + im2.width, im1.height))
+    dst.paste(im1, (0, 0))
+    dst.paste(im2, (im1.width, 0))
+    return dst
+
+
+def process_img(img_file, random=False):
+    if type(img_file) == str:
+        img_file = [img_file]
+        
+    input_img = []
+    for img in img_file:
+        image = Image.open(img).convert('RGB')
+        w, h = image.size
+        crop = min(w, h)
+        if random:
+            image = T.Resize(560, interpolation=T.InterpolationMode.BILINEAR)(image)
+            image = T.RandomCrop(512)(image)
+            image = T.RandomHorizontalFlip()(image)
+        else:
+            image = image.crop(((w - crop) // 2, (h - crop) // 2, (w + crop) // 2, (h + crop) // 2))
+        input_img_ = image = image.resize((512, 512), Image.LANCZOS)
+        input_img.append(ToTensor()(image).unsqueeze(0))
+    input_img = torch.cat(input_img).to("cuda").to(vae.dtype)
+    img_latents = vae.encode(input_img * 2.0 - 1.0).latent_dist.sample()
+    img_latents = img_latents * vae.config.scaling_factor
+
+    img_4_clip = processor(input_img)
+    vision_embeds = openclip.vision_model(img_4_clip, output_hidden_states=True)
+    vision_hidden_states = vision_embeds.last_hidden_state
+    return img_latents, vision_hidden_states, input_img_
+
+
+processor = Compose([
+    Resize(224, interpolation=BICUBIC),
+    Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+])
+
+#model_path = "./identity_small"
+model_path = "./pretrained"
+use_fp16 = True
+scheduler = DDIMScheduler.from_pretrained(model_path, subfolder="scheduler")  # must use DDIM when refine_step > 0
+
+if use_fp16:
+    pipe = StableDiffusionPromptNetPipeline.from_pretrained(model_path, scheduler=scheduler, torch_dtype=torch.float16)
+    weight_dtype = torch.float16
+else:
+    pipe = StableDiffusionPromptNetPipeline.from_pretrained(model_path, scheduler=scheduler)
+    weight_dtype = torch.float32
+    
+pipe.to("cuda")
+vae = pipe.vae
+tokenizer = pipe.tokenizer
+openclip = pipe.openclip
+text_encoder = openclip.text_model
+vision_encoder = openclip.vision_model
+promptnet = pipe.promptnet
+unet = pipe.unet
+
+# Freeze vae and text_encoder
+vae.requires_grad_(False)
+openclip.requires_grad_(False)
+unet.requires_grad_(False)
+
+print(f"Model {model_path} has been loaded")
+
+# load the trained model
+save_path = './saved_model'
+scheduler = DDIMScheduler.from_pretrained(save_path, subfolder="scheduler")  # must use DDIM when refine_step > 0
+if use_fp16:
+    pipe = StableDiffusionPromptNetPipeline.from_pretrained(save_path, scheduler=scheduler, torch_dtype=torch.float16)
+    weight_dtype = torch.float16
+else:
+    pipe = StableDiffusionPromptNetPipeline.from_pretrained(save_path, scheduler=scheduler)
+    weight_dtype = torch.float32
+pipe.to("cuda")
+print(f"Model loaded from {save_path}")
+
+import abc
+import ptp_utils
+from typing import List
+import numpy as np
+
+class AttentionControl(abc.ABC):
+    
+    def step_callback(self, x_t):
+        return x_t
+    
+    def between_steps(self):
+        return
+    
+    @property
+    def num_uncond_att_layers(self):
+        return 0
+    
+    @abc.abstractmethod
+    def forward (self, attn, is_cross: bool, place_in_unet: str):
+        raise NotImplementedError
+
+    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+        if self.cur_att_layer >= self.num_uncond_att_layers:
+            h = attn.shape[0]
+            attn[h // 2:] = self.forward(attn[h // 2:], is_cross, place_in_unet)
+        self.cur_att_layer += 1
+        if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
+            self.cur_att_layer = 0
+            self.cur_step += 1
+            self.between_steps()
+        return attn
+    
+    def reset(self):
+        self.cur_step = 0
+        self.cur_att_layer = 0
+
+    def __init__(self):
+        self.cur_step = 0
+        self.num_att_layers = -1
+        self.cur_att_layer = 0
+
+class EmptyControl(AttentionControl):
+    
+    def forward (self, attn, is_cross: bool, place_in_unet: str):
+        return attn
+    
+    
+class AttentionStore(AttentionControl):
+
+    @staticmethod
+    def get_empty_store():
+        return {"down_cross": [], "mid_cross": [], "up_cross": [],
+                "down_self": [],  "mid_self": [],  "up_self": []}
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+            self.step_store[key].append(attn)
+        return attn
+
+    def between_steps(self):
+        if len(self.attention_store) == 0:
+            self.attention_store = self.step_store
+        else:
+            for key in self.attention_store:
+                for i in range(len(self.attention_store[key])):
+                    self.attention_store[key][i] += self.step_store[key][i]
+        self.step_store = self.get_empty_store()
+
+    def get_average_attention(self):
+        average_attention = {key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store}
+        return average_attention
+
+
+    def reset(self):
+        super(AttentionStore, self).reset()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+
+    def __init__(self):
+        super(AttentionStore, self).__init__()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        
+from PIL import Image
+
+def aggregate_attention(attention_store: AttentionStore, res: int, from_where: List[str], is_cross: bool, select: int):
+    len_prompts = 1 # prompt 개수가 여러 개일 경우 len(prompts)로 변경하기 prompts = [prompt1, prompt2, ...]
+    out = []
+    attention_maps = attention_store.get_average_attention()
+    num_pixels = res ** 2
+    for location in from_where:
+        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
+            if item.shape[1] == num_pixels:
+                cross_maps = item.reshape(len_prompts, -1, res , res, item.shape[-1])[select]
+                out.append(cross_maps)
+    out = torch.cat(out, dim=0)
+    out = out.sum(0) / out.shape[0]
+    return out.cpu()
+
+def show_cross_attention(attention_store: AttentionStore, res: int, from_where: List[str], select = 0):
+    tokens = tokenizer.encode(prompt)
+    decoder = tokenizer.decode
+    attention_maps = aggregate_attention(attention_store, res, from_where, True, select)
+    images = []
+    for i in range(len(tokens)):
+        image = attention_maps[:, :, i]
+        image = 255 * image / image.max()
+        image = image.unsqueeze(-1).expand(*image.shape, 3)
+        image = image.numpy().astype(np.uint8)
+        image = np.array(Image.fromarray(image).resize((256, 256)))
+        image = ptp_utils.text_under_image(image, decoder(int(tokens[i])))
+        images.append(image)
+    ptp_utils.view_images(np.stack(images, axis=0))
+
+def register_attention_control(model, controller):
+    def ca_forward(self, place_in_unet):
+        to_out = self.to_out
+        if type(to_out) is torch.nn.modules.container.ModuleList:
+            to_out = self.to_out[0]
+        else:
+            to_out = self.to_out
+
+        def forward(x, context=None, mask=None):
+            batch_size, sequence_length, dim = x.shape
+            h = self.heads
+            q = self.to_q(x)
+            is_cross = context is not None
+            context = context if is_cross else x
+            k = self.to_k(context)
+            v = self.to_v(context)
+            q = self.reshape_heads_to_batch_dim(q)
+            k = self.reshape_heads_to_batch_dim(k)
+            v = self.reshape_heads_to_batch_dim(v)
+
+            sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
+
+            if mask is not None:
+                mask = mask.reshape(batch_size, -1)
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = mask[:, None, :].repeat(h, 1, 1)
+                sim.masked_fill_(~mask, max_neg_value)
+
+            # attention, what we cannot get enough of
+            attn = sim.softmax(dim=-1)
+            attn = controller(attn, is_cross, place_in_unet)
+            out = torch.einsum("b i j, b j d -> b i d", attn, v)
+            out = self.reshape_batch_dim_to_heads(out)
+            return to_out(out)
+
+        return forward
+
+    class DummyController:
+
+        def __call__(self, *args):
+            return args[0]
+
+        def __init__(self):
+            self.num_att_layers = 0
+
+    if controller is None:
+        controller = DummyController()
+
+    def register_recr(net_, count, place_in_unet):
+        if net_.__class__.__name__ == 'CrossAttention':
+            net_.forward = ca_forward(net_, place_in_unet)
+            return count + 1
+        elif hasattr(net_, 'children'):
+            for net__ in net_.children():
+                count = register_recr(net__, count, place_in_unet)
+        return count
+
+    cross_att_count = 0
+    sub_nets = model.unet.named_children()
+    for net in sub_nets:
+        if "down" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "down")
+        elif "up" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "up")
+        elif "mid" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "mid")
+
+    controller.num_att_layers = cross_att_count
+    
+def run_and_display(controller, ref_image_latent, ref_image_embed, **kwargs):
+    image = ptp_utils.text2image_ldm_stable(pipe, controller, ref_image_latent, ref_image_embed, **kwargs)
+    #ptp_utils.view_images(images)
+    return image
+    
+test_img = './seulgi.jpg'
+prompt = "reading a book"
+
+# proposed fusion sampling
+kwargs = sampling_kwargs(prompt = prompt,
+                         step = 50, # sampling steps
+                         cfg = 7.0, # increase this if you want more information from the input image. decrease this when you find information from image is too strong (fails to generate according to text)
+                         ref_cfg = 5.0, # increase this if you want more information from the prompt 
+                         fusion = True, # use fusion sampling or not
+                         refine_step = 1, # when fusion=True, refine_step=0 means we consider conditions to be independent, refine_step>0 means we consider them as dependent
+                         refine_emb_scale = 0.6, # increase this if you want some more information from input image, decrease if text information is not correctly generated. Normally 0.4~0.9 should work.
+                         refine_cfg=7.0, # guidance for fusion step sampling
+                        )
+gt_latents, vision_hidden_states, input_img_ = process_img(test_img)
+print("Results after fine-tuning, WITH fusion sampling")
+controller = AttentionStore()
+image = run_and_display(controller, ref_image_latent=gt_latents, ref_image_embed=vision_hidden_states, **kwargs)[0]
+get_concat_h(input_img_, image).show()
+show_cross_attention(controller, res = 16, from_where=("up", "down", "mid"))
+show_cross_attention(controller, res=32, from_where=("up", "down", "mid"))
